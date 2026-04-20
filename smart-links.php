@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Aspen Smart Links
  * Description: Adds a shortcode button that applies/removes a FluentCRM tag and optionally opens an external URL in a new tab.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: Aspen
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! defined( 'ASPEN_SMART_LINKS_VERSION' ) ) {
-	define( 'ASPEN_SMART_LINKS_VERSION', '1.0.0' );
+	define( 'ASPEN_SMART_LINKS_VERSION', '1.0.1' );
 }
 if ( ! defined( 'ASPEN_SMART_LINKS_PLUGIN_FILE' ) ) {
 	define( 'ASPEN_SMART_LINKS_PLUGIN_FILE', __FILE__ );

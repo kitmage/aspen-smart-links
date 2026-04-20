@@ -348,46 +348,56 @@ final class Aspen_Smart_Links {
 			return null;
 		}
 
-		$user = get_userdata( $user_id );
-		if ( ! $user || empty( $user->user_email ) ) {
+		$contacts_api = $this->get_fluentcrm_contacts_api();
+		if ( ! is_object( $contacts_api ) ) {
+			$this->debug_log( 'FluentCRM: Contacts API unavailable', array( 'user_id' => $user_id ) );
 			return false;
 		}
 
-		$email = (string) $user->user_email;
+		$user = get_userdata( $user_id );
+		if ( ! $user || empty( $user->user_email ) ) {
+			$this->debug_log( 'FluentCRM: missing WP user email', array( 'user_id' => $user_id ) );
+			return false;
+		}
+
+		$email = sanitize_email( (string) $user->user_email );
+		if ( '' === $email ) {
+			$this->debug_log( 'FluentCRM: invalid WP user email', array( 'user_id' => $user_id ) );
+			return false;
+		}
 
 		try {
-			$contact = $this->get_fluentcrm_contact_by_email( $email );
+			$contact = null;
 
-			if ( ! $contact ) {
-				$create_if_missing = (bool) apply_filters( 'aspen_smart_links_fluentcrm_create_if_missing', true, $user_id, $action, $tag_id );
-				if ( ! $create_if_missing ) {
-					return false;
-				}
-
-				$contact = $this->create_fluentcrm_contact_from_user( $user );
+			if ( method_exists( $contacts_api, 'getContactByUserRef' ) ) {
+				$contact = $contacts_api->getContactByUserRef( $user_id );
 			}
 
-			$contact_id = $this->get_fluentcrm_contact_id( $contact );
-			if ( ! $contact_id ) {
-				return false;
+			if ( ! $contact && method_exists( $contacts_api, 'getContact' ) ) {
+				$contact = $contacts_api->getContact( $email );
 			}
 
 			$tag_ids = array( absint( $tag_id ) );
 
-			$contacts_api = $this->get_fluentcrm_contacts_api();
-			if ( is_object( $contacts_api ) ) {
-				if ( 'add' === $action && method_exists( $contacts_api, 'attachTags' ) ) {
-					$contacts_api->attachTags( $contact_id, $tag_ids );
-					return true;
-				}
-				if ( 'remove' === $action && method_exists( $contacts_api, 'detachTags' ) ) {
-					$contacts_api->detachTags( $contact_id, $tag_ids );
-					return true;
+			$contact_exists = is_object( $contact );
+
+			if ( ! $contact_exists ) {
+				$create_if_missing = (bool) apply_filters( 'aspen_smart_links_fluentcrm_create_if_missing', true, $user_id, $action, $tag_id );
+				if ( ! $create_if_missing ) {
+					$this->debug_log(
+						'FluentCRM: contact not found (create disabled)',
+						array(
+							'user_id' => $user_id,
+							'action'  => $action,
+							'tag_id'  => $tag_id,
+						)
+					);
+					return false;
 				}
 			}
 
-			// Fallback to methods on the returned contact object.
-			if ( is_object( $contact ) ) {
+			// Fast path: use Subscriber model methods when a contact exists.
+			if ( $contact_exists ) {
 				if ( 'add' === $action && method_exists( $contact, 'attachTags' ) ) {
 					$contact->attachTags( $tag_ids );
 					return true;
@@ -396,22 +406,87 @@ final class Aspen_Smart_Links {
 					$contact->detachTags( $tag_ids );
 					return true;
 				}
-				if ( 'add' === $action && method_exists( $contact, 'addTags' ) ) {
-					$contact->addTags( $tag_ids );
-					return true;
-				}
-				if ( 'remove' === $action && method_exists( $contact, 'removeTags' ) ) {
-					$contact->removeTags( $tag_ids );
-					return true;
-				}
 			}
+
+			// Fallback: use Contacts API createOrUpdate() with tags/detach_tags.
+			if ( ! method_exists( $contacts_api, 'createOrUpdate' ) ) {
+				$this->debug_log(
+					'FluentCRM: Contacts API missing createOrUpdate()',
+					array(
+						'user_id' => $user_id,
+						'action'  => $action,
+						'tag_id'  => $tag_id,
+					)
+				);
+				return false;
+			}
+
+			$data = array(
+				'email' => $email,
+			);
+
+			if ( ! $contact_exists ) {
+				$data['first_name'] = sanitize_text_field( (string) $user->first_name );
+				$data['last_name']  = sanitize_text_field( (string) $user->last_name );
+			}
+
+			if ( 'add' === $action ) {
+				$data['tags'] = $tag_ids;
+			} else {
+				$data['detach_tags'] = $tag_ids;
+			}
+
+			/**
+			 * Filter contact data used when updating/creating a FluentCRM contact.
+			 *
+			 * @param array   $data   Contact data.
+			 * @param WP_User $user   WP user.
+			 * @param string  $action add|remove.
+			 * @param int     $tag_id Tag ID.
+			 */
+			$data = (array) apply_filters( 'aspen_smart_links_fluentcrm_contact_data', $data, $user, $action, $tag_id );
+
+			$result = $contacts_api->createOrUpdate( $data );
+			if ( ! $result ) {
+				$this->debug_log(
+					'FluentCRM: createOrUpdate failed',
+					array(
+						'user_id'        => $user_id,
+						'action'         => $action,
+						'tag_id'         => $tag_id,
+						'contact_exists' => $contact_exists,
+					)
+				);
+				return false;
+			}
+
+			return true;
 		} catch ( Exception $e ) {
+			$this->debug_log(
+				'FluentCRM: exception',
+				array(
+					'user_id'  => $user_id,
+					'action'   => $action,
+					'tag_id'   => $tag_id,
+					'message'  => $e->getMessage(),
+					'code'     => $e->getCode(),
+					'exception'=> get_class( $e ),
+				)
+			);
 			return false;
 		} catch ( Error $e ) {
+			$this->debug_log(
+				'FluentCRM: error',
+				array(
+					'user_id' => $user_id,
+					'action'  => $action,
+					'tag_id'  => $tag_id,
+					'message' => $e->getMessage(),
+					'error'   => get_class( $e ),
+				)
+			);
 			return false;
 		}
-
-		return false;
 	}
 
 	/**
@@ -420,7 +495,7 @@ final class Aspen_Smart_Links {
 	 * @return bool
 	 */
 	private function is_fluentcrm_available() {
-		return function_exists( 'FluentCrmApi' ) || class_exists( '\FluentCrm\App\Models\Subscriber' );
+		return function_exists( 'FluentCrmApi' );
 	}
 
 	/**
@@ -429,10 +504,6 @@ final class Aspen_Smart_Links {
 	 * @return object|null
 	 */
 	private function get_fluentcrm_contacts_api() {
-		if ( ! function_exists( 'FluentCrmApi' ) ) {
-			return null;
-		}
-
 		try {
 			$api = FluentCrmApi( 'contacts' );
 			return is_object( $api ) ? $api : null;
@@ -444,120 +515,27 @@ final class Aspen_Smart_Links {
 	}
 
 	/**
-	 * Find a FluentCRM contact by email.
+	 * Debug logger (off by default unless WP debug logging is enabled).
 	 *
-	 * @param string $email Email address.
-	 * @return object|null
+	 * @param string $message Message.
+	 * @param array  $context Context (no PII).
 	 */
-	private function get_fluentcrm_contact_by_email( $email ) {
-		$email = sanitize_email( (string) $email );
-		if ( '' === $email ) {
-			return null;
+	private function debug_log( $message, $context = array() ) {
+		$default_enabled = ( defined( 'WP_DEBUG' ) && WP_DEBUG && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG );
+		$enabled         = (bool) apply_filters( 'aspen_smart_links_debug', $default_enabled, $message, $context );
+		if ( ! $enabled ) {
+			return;
 		}
 
-		// Prefer FluentCRM's Subscriber model when available (direct lookup).
-		if ( class_exists( '\FluentCrm\App\Models\Subscriber' ) && method_exists( '\FluentCrm\App\Models\Subscriber', 'where' ) ) {
-			try {
-				$subscriber = \FluentCrm\App\Models\Subscriber::where( 'email', $email )->first();
-				return is_object( $subscriber ) ? $subscriber : null;
-			} catch ( Exception $e ) {
-				// Fall through to API attempts.
-			} catch ( Error $e ) {
-				// Fall through to API attempts.
-			}
+		$prefix = '[Aspen Smart Links] ';
+
+		$line = $prefix . (string) $message;
+		if ( is_array( $context ) && ! empty( $context ) ) {
+			$line .= ' ' . wp_json_encode( $context );
 		}
 
-		$contacts_api = $this->get_fluentcrm_contacts_api();
-		if ( ! is_object( $contacts_api ) ) {
-			return null;
-		}
-
-		try {
-			if ( method_exists( $contacts_api, 'getContactByEmail' ) ) {
-				$contact = $contacts_api->getContactByEmail( $email );
-				return is_object( $contact ) ? $contact : null;
-			}
-
-			if ( method_exists( $contacts_api, 'getContact' ) ) {
-				$contact = $contacts_api->getContact( $email );
-				return is_object( $contact ) ? $contact : null;
-			}
-		} catch ( Exception $e ) {
-			return null;
-		} catch ( Error $e ) {
-			return null;
-		}
-
-		return null;
-	}
-
-	/**
-	 * Create (or update) a FluentCRM contact from a WP user.
-	 *
-	 * @param WP_User $user WP user.
-	 * @return object|null
-	 */
-	private function create_fluentcrm_contact_from_user( $user ) {
-		$contacts_api = $this->get_fluentcrm_contacts_api();
-		if ( ! is_object( $contacts_api ) ) {
-			return null;
-		}
-
-		$data = array(
-			'email'      => sanitize_email( (string) $user->user_email ),
-			'first_name' => sanitize_text_field( (string) $user->first_name ),
-			'last_name'  => sanitize_text_field( (string) $user->last_name ),
-		);
-
-		/**
-		 * Filter contact data used when creating/updating a FluentCRM contact.
-		 *
-		 * @param array   $data    Contact data.
-		 * @param WP_User $user    WP user.
-		 */
-		$data = (array) apply_filters( 'aspen_smart_links_fluentcrm_contact_data', $data, $user );
-
-		try {
-			if ( method_exists( $contacts_api, 'createOrUpdate' ) ) {
-				$contact = $contacts_api->createOrUpdate( $data );
-				return is_object( $contact ) ? $contact : null;
-			}
-
-			if ( method_exists( $contacts_api, 'create' ) ) {
-				$contact = $contacts_api->create( $data );
-				return is_object( $contact ) ? $contact : null;
-			}
-		} catch ( Exception $e ) {
-			return null;
-		} catch ( Error $e ) {
-			return null;
-		}
-
-		return null;
-	}
-
-	/**
-	 * Get a FluentCRM contact ID from various possible object shapes.
-	 *
-	 * @param object|null $contact Contact object.
-	 * @return int
-	 */
-	private function get_fluentcrm_contact_id( $contact ) {
-		if ( ! is_object( $contact ) ) {
-			return 0;
-		}
-
-		if ( isset( $contact->id ) ) {
-			return absint( $contact->id );
-		}
-		if ( isset( $contact->contact_id ) ) {
-			return absint( $contact->contact_id );
-		}
-		if ( isset( $contact->subscriber_id ) ) {
-			return absint( $contact->subscriber_id );
-		}
-
-		return 0;
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log( $line );
 	}
 
 	/**
