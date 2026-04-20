@@ -1,42 +1,36 @@
-How It Works
-Internal URL Example
-[crm_tag_button text="Next Lesson" action="add" tag_id="12" url="/lesson-2/"]
-Result:
-Add tag
-Current tab goes to /lesson-2/
-External URL Example
-[crm_tag_button text="Open Resource" action="add" tag_id="12" url="https://google.com"]
-Result:
-New tab opens https://google.com
-Current tab submits form
-Tag added
-Current page reloads
-Important Browser Note
+# Aspen Smart Links
 
-Browsers allow window.open() here because it happens directly from a click/submit event.
+Adds a production-ready WordPress plugin that provides a shortcode button which can apply/remove a FluentCRM tag ID for the current user and then redirect.
 
-If popup blockers are aggressive, some browsers may block it—but usually this pattern works.
+Requires: FluentCRM (for tag syncing).
 
-Recommended Improvement
+## Shortcode
 
-Use a loading state so users don’t double-click:
+Internal URL example:
 
-button.disabled = true;
-button.innerText = 'Loading...';
+`[crm_tag_button text="Next Lesson" action="add" tag_id="12" url="/lesson-2/"]`
 
-I can add that next if you'd like.
+- Updates the user's tag list
+- Redirects the current tab to `/lesson-2/`
 
-Even Better Version (Recommended)
+External URL example:
 
-I can also upgrade this to:
+`[crm_tag_button text="Open Resource" action="add" tag_id="12" url="https://google.com"]`
 
-Smart UX Version
+- Opens `https://google.com` in a new tab (best effort)
+- Processes the tag action in the current tab
+- Redirects back to the current page
 
-For external links:
+## Notes
 
-opens new tab
-button changes to “Opened”
-current page refreshes cleanly
-prevents double clicks
-works with Elementor buttons
-optional icon
+- Buttons only render for logged-in users.
+- External URL opening depends on browser popup policy. The plugin triggers `window.open()` from the form submit event, which is typically allowed.
+- FluentCRM is the primary tag store (by contact email). Optionally, the plugin can also store tag IDs in user meta under `aspen_smart_links_tags`.
+
+## Hooks
+
+- Filter `aspen_smart_links_handle_tag_action`: Return `true`/`false` to fully handle the tag action, or `null` to fall back to the default behavior.
+- Filter `aspen_smart_links_enable_fluentcrm`: Return `false` to disable FluentCRM syncing.
+- Filter `aspen_smart_links_fluentcrm_create_if_missing`: Return `false` to avoid creating a FluentCRM contact when missing (default: true).
+- Filter `aspen_smart_links_store_user_meta`: Return `true` to store tag IDs in user meta.
+- Action `aspen_smart_links_tag_action`: Fired after processing.
