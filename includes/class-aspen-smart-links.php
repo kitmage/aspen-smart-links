@@ -61,6 +61,7 @@ final class Aspen_Smart_Links {
 
 		add_action( 'init', array( $this, 'register_shortcodes' ) );
 		add_action( 'wp_enqueue_scripts', array( $this, 'register_assets' ) );
+		add_action( 'template_redirect', array( $this, 'maybe_handle_template_redirect' ), 1 );
 
 		add_action( 'admin_post_' . self::ACTION, array( $this, 'handle_admin_post' ) );
 		add_action( 'admin_post_' . self::LEGACY_ACTION, array( $this, 'handle_admin_post' ) );
@@ -158,26 +159,34 @@ final class Aspen_Smart_Links {
 
 		$nonce_action = 'aspen_smart_links|' . $action . '|' . $tag_id;
 
+		$current_url = home_url( add_query_arg( array(), wp_unslash( $_SERVER['REQUEST_URI'] ?? '/' ) ) );
+
+		if ( $is_external ) {
+			$redirect_target = $current_url;
+		} else {
+			$redirect_target = $url;
+		}
+
+		$redirect_target = rawurlencode( $redirect_target );
+
+		$nonce_value = wp_create_nonce( $nonce_action );
+
 		ob_start();
 		?>
 		<form
-			method="post"
+			method="get"
 			id="<?php echo esc_attr( $form_id ); ?>"
-			action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>"
+			action="<?php echo esc_url( $current_url ); ?>"
 			style="display:inline;"
 			data-aspen-smart-links="1"
 			<?php if ( $is_external ) : ?>
 				data-aspen-external-url="<?php echo esc_url( $url ); ?>"
 			<?php endif; ?>
 		>
-			<input type="hidden" name="action" value="<?php echo esc_attr( self::ACTION ); ?>">
 			<input type="hidden" name="asl_action" value="<?php echo esc_attr( $action ); ?>">
 			<input type="hidden" name="asl_tag_id" value="<?php echo esc_attr( $tag_id ); ?>">
-			<?php if ( ! $is_external ) : ?>
-				<input type="hidden" name="asl_redirect" value="<?php echo esc_url( $url ); ?>">
-			<?php endif; ?>
-
-			<?php wp_nonce_field( $nonce_action, '_aspen_smart_links_nonce' ); ?>
+			<input type="hidden" name="asl_redirect" value="<?php echo esc_attr( $redirect_target ); ?>">
+			<input type="hidden" name="_aspen_smart_links_nonce" value="<?php echo esc_attr( $nonce_value ); ?>">
 
 			<button type="submit" <?php echo '' !== $class ? 'class="' . esc_attr( $class ) . '"' : ''; ?>>
 				<?php echo esc_html( $text ); ?>
@@ -185,6 +194,61 @@ final class Aspen_Smart_Links {
 		</form>
 		<?php
 		return (string) ob_get_clean();
+	}
+
+	/**
+	 * Handle tag actions triggered via query args (front-end).
+	 *
+	 * This approach works well with FluentCRM because it runs on a normal front-end request.
+	 */
+	public function maybe_handle_template_redirect() {
+		if ( empty( $_GET['asl_action'] ) || empty( $_GET['asl_tag_id'] ) || empty( $_GET['_aspen_smart_links_nonce'] ) ) {
+			return;
+		}
+
+		$current_url = home_url( add_query_arg( array(), wp_unslash( $_SERVER['REQUEST_URI'] ?? '/' ) ) );
+		$clean_url   = remove_query_arg(
+			array(
+				'asl_action',
+				'asl_tag_id',
+				'asl_redirect',
+				'_aspen_smart_links_nonce',
+			),
+			$current_url
+		);
+
+		if ( ! is_user_logged_in() ) {
+			wp_safe_redirect( wp_login_url( $clean_url ) );
+			exit;
+		}
+
+		$action = sanitize_key( (string) wp_unslash( $_GET['asl_action'] ) );
+		$tag_id = absint( wp_unslash( $_GET['asl_tag_id'] ) );
+		$nonce  = sanitize_text_field( (string) wp_unslash( $_GET['_aspen_smart_links_nonce'] ) );
+
+		if ( ! in_array( $action, array( 'add', 'remove' ), true ) || ! $tag_id ) {
+			$this->safe_redirect( $clean_url );
+		}
+
+		if ( ! wp_verify_nonce( $nonce, 'aspen_smart_links|' . $action . '|' . $tag_id ) ) {
+			$this->safe_redirect( $clean_url );
+		}
+
+		$redirect = isset( $_GET['asl_redirect'] ) ? (string) wp_unslash( $_GET['asl_redirect'] ) : '';
+		$redirect = rawurldecode( $redirect );
+
+		$user_id = get_current_user_id();
+
+		$context = array(
+			'request_action' => 'template_redirect',
+			'referer'        => wp_get_referer(),
+		);
+
+		$result = $this->apply_tag_action( $user_id, $action, $tag_id, $context );
+
+		do_action( 'aspen_smart_links_tag_action', $user_id, $action, $tag_id, $result, $context );
+
+		$this->safe_redirect( '' !== $redirect ? $redirect : $clean_url );
 	}
 
 	/**
@@ -348,6 +412,45 @@ final class Aspen_Smart_Links {
 			return null;
 		}
 
+		if ( function_exists( 'fluentcrm_get_current_contact' ) ) {
+			$contact = fluentcrm_get_current_contact();
+			if ( is_object( $contact ) ) {
+				try {
+					$tag_ids = array( absint( $tag_id ) );
+					if ( 'add' === $action && method_exists( $contact, 'attachTags' ) ) {
+						$contact->attachTags( $tag_ids );
+						return true;
+					}
+					if ( 'remove' === $action && method_exists( $contact, 'detachTags' ) ) {
+						$contact->detachTags( $tag_ids );
+						return true;
+					}
+				} catch ( Exception $e ) {
+					$this->debug_log(
+						'FluentCRM: fluentcrm_get_current_contact exception',
+						array(
+							'user_id' => $user_id,
+							'action'  => $action,
+							'tag_id'  => $tag_id,
+							'message' => $e->getMessage(),
+						)
+					);
+					return false;
+				} catch ( Error $e ) {
+					$this->debug_log(
+						'FluentCRM: fluentcrm_get_current_contact error',
+						array(
+							'user_id' => $user_id,
+							'action'  => $action,
+							'tag_id'  => $tag_id,
+							'message' => $e->getMessage(),
+						)
+					);
+					return false;
+				}
+			}
+		}
+
 		$contacts_api = $this->get_fluentcrm_contacts_api();
 		if ( ! is_object( $contacts_api ) ) {
 			$this->debug_log( 'FluentCRM: Contacts API unavailable', array( 'user_id' => $user_id ) );
@@ -495,7 +598,7 @@ final class Aspen_Smart_Links {
 	 * @return bool
 	 */
 	private function is_fluentcrm_available() {
-		return function_exists( 'FluentCrmApi' );
+		return function_exists( 'FluentCrmApi' ) || function_exists( 'fluentcrm_get_current_contact' );
 	}
 
 	/**
